@@ -42,7 +42,7 @@ API_BETA_HEADER  = "oauth-2025-04-20"
 REFRESH_MS       = 10 * 60 * 1000   # 10 minutes
 POLL_MS          = 500
 WIDGET_W         = 280
-WIDGET_H         = 310
+WIDGET_H         = 340
 POS_FILE         = Path.home() / ".claude" / "meter_pos.json"
 CACHE_FILE       = Path.home() / ".claude" / "meter_cache.json"
 
@@ -210,6 +210,7 @@ class UsageFetcher:
             fh = raw.get("five_hour") or {}
             log.debug("five_hour raw: %s", fh)
             log.debug("seven_day raw: %s", sd)
+            log.debug("extra_usage in anthropic response: %s", raw.get("extra_usage"))
         except urllib.error.HTTPError as e:
             if e.code == 401:
                 raise FetchError("Token expired or invalid (401)")
@@ -219,7 +220,12 @@ class UsageFetcher:
         except urllib.error.URLError as e:
             raise FetchError(f"Network error: {e.reason}")
 
-        extra_usage = self._fetch_extra_usage(token)
+        # Use extra_usage from the anthropic response if available,
+        # otherwise fall back to the claude.ai endpoint (requires browser session)
+        if raw.get("extra_usage") is not None:
+            extra_usage = raw.get("extra_usage")
+        else:
+            extra_usage = self._fetch_extra_usage(token)
         return self._parse(raw, extra_usage)
 
     def _parse(self, raw: dict, extra_usage: Optional[dict] = None) -> UsageData:
@@ -421,7 +427,7 @@ class ClaudeMeterWidget:
                                      fg=FG_DIM, font=("Segoe UI", 8))
         self.lbl_5h_reset.pack(anchor="w")
 
-        tk.Frame(body, bg="#2a2a4a", height=1).pack(fill="x", pady=5)
+        tk.Frame(body, bg="#2a2a4a", height=1).pack(fill="x", pady=3)
 
         # 7-day section
         tk.Label(body, text="7-DAY WINDOW", bg=BG, fg=FG_DIM,
@@ -437,7 +443,7 @@ class ClaudeMeterWidget:
 
         # Per-model labels
         self.model_frame = tk.Frame(body, bg=BG)
-        self.model_frame.pack(fill="x", pady=(4, 0))
+        self.model_frame.pack(fill="x", pady=(2, 0))
         self.lbl_sonnet = tk.Label(self.model_frame, text="", bg=BG,
                                    fg=FG_LABEL, font=("Segoe UI", 8))
         self.lbl_sonnet.pack(anchor="w")
@@ -446,7 +452,7 @@ class ClaudeMeterWidget:
         self.lbl_opus.pack(anchor="w")
 
         # Extra Usage section
-        tk.Frame(body, bg="#2a2a4a", height=1).pack(fill="x", pady=5)
+        tk.Frame(body, bg="#2a2a4a", height=1).pack(fill="x", pady=3)
         self.extra_frame = tk.Frame(body, bg=BG)
         self.extra_frame.pack(fill="x")
         tk.Label(self.extra_frame, text="EXTRA USAGE", bg=BG, fg=FG_DIM,
@@ -457,7 +463,7 @@ class ClaudeMeterWidget:
         self.lbl_extra.pack(anchor="w")
 
         # Footer
-        tk.Frame(body, bg="#2a2a4a", height=1).pack(fill="x", pady=(5, 3))
+        tk.Frame(body, bg="#2a2a4a", height=1).pack(fill="x", pady=(3, 2))
         self.lbl_updated = tk.Label(body, text="Fetching...", bg=BG,
                                     fg=FG_LABEL, font=("Segoe UI", 8))
         self.lbl_updated.pack(anchor="w")
