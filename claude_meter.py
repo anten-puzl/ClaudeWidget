@@ -3,13 +3,17 @@ Claude Meter - Desktop widget showing Claude Code Pro usage limits.
 Reads OAuth token from ~/.claude/.credentials.json and queries Anthropic API.
 """
 
+import base64
 import ctypes
 import json
 import logging
+import os
 import queue
+import sqlite3
 import threading
 import tkinter as tk
 import urllib.error
+import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
@@ -32,6 +36,30 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
+# .env loader  (no external deps)
+# ---------------------------------------------------------------------------
+
+ENV_FILE = Path(__file__).parent / ".env"
+
+
+def _load_env_file() -> None:
+    """Parse .env next to this script and inject missing keys into os.environ."""
+    if not ENV_FILE.exists():
+        return
+    for line in ENV_FILE.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        k, _, v = line.partition("=")
+        k = k.strip()
+        if k and k not in os.environ:
+            os.environ[k] = v.strip()
+
+
+_load_env_file()
+
+
+# ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
 
@@ -42,9 +70,16 @@ API_BETA_HEADER  = "oauth-2025-04-20"
 REFRESH_MS       = 10 * 60 * 1000   # 10 minutes
 POLL_MS          = 500
 WIDGET_W         = 280
-WIDGET_H         = 340
+WIDGET_H         = 440
 POS_FILE         = Path.home() / ".claude" / "meter_pos.json"
 CACHE_FILE       = Path.home() / ".claude" / "meter_cache.json"
+
+# Google Antigravity IDE
+ANTIGRAVITY_DB        = Path(os.environ.get("APPDATA", "")) / "Antigravity" / "User" / "globalStorage" / "state.vscdb"
+ANTIGRAVITY_TOKEN_URL = "https://oauth2.googleapis.com/token"
+ANTIGRAVITY_QUOTA_URL = "https://cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels"
+ANTIGRAVITY_UA        = "antigravity/1.0.0"
+# Client credentials are loaded from .env (never hardcoded here)
 
 # Colors
 BG       = "#1a1a2e"
@@ -74,6 +109,15 @@ class UsageData:
     extra_enabled: bool = False
     extra_limit_cents: int = 0
     extra_used_cents: float = 0.0
+
+
+@dataclass
+class AntigravityData:
+    sprint_pct: float
+    sprint_resets_at: datetime
+    weekly_pct: float
+    weekly_resets_at: datetime
+    last_updated: datetime
 
 
 class FetchError(Exception):
@@ -271,6 +315,178 @@ class UsageFetcher:
 
 
 # ---------------------------------------------------------------------------
+# Google Antigravity fetcher
+# ---------------------------------------------------------------------------
+
+class AntigravityFetcher:
+    """Reads quota data from Google Antigravity IDE via cloudcode-pa API."""
+
+    # ------------------------------------------------------------------
+    # Token extraction from state.vscdb (nested protobuf → base64)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _read_varint(data: bytes, pos: int):
+        val, shift = 0, 0
+        while pos < len(data):
+            b = data[pos]; pos += 1
+            val |= (b & 0x7f) << shift; shift += 7
+            if not (b & 0x80):
+                break
+        return val, pos
+
+    @staticmethod
+    def _parse_ld_fields(data: bytes):
+        """Yield (field_num, value_bytes) for wire-type-2 (length-delimited) fields."""
+        i = 0
+        while i < len(data):
+            if i >= len(data):
+                break
+            tag = data[i]; i += 1
+            field, wire = tag >> 3, tag & 7
+            if wire == 2:
+                length, i = AntigravityFetcher._read_varint(data, i)
+                yield field, data[i:i + length]
+                i += length
+            elif wire == 0:
+                _, i = AntigravityFetcher._read_varint(data, i)
+            else:
+                return
+
+    def _get_refresh_token(self) -> str:
+        if not ANTIGRAVITY_DB.exists():
+            raise FetchError("Antigravity not installed")
+        try:
+            conn = sqlite3.connect(str(ANTIGRAVITY_DB))
+            try:
+                cur = conn.cursor()
+                cur.execute("SELECT value FROM ItemTable WHERE key=?",
+                            ("antigravityUnifiedStateSync.oauthToken",))
+                row = cur.fetchone()
+            finally:
+                conn.close()
+        except sqlite3.Error as e:
+            raise FetchError(f"Antigravity DB error: {e}")
+
+        if not row:
+            raise FetchError("Antigravity: not signed in")
+
+        # Outer proto → field1 → field2 → field1(inner b64) → inner proto → field3=refresh_token
+        outer = base64.b64decode(row[0] + "==")
+        for _, v1 in self._parse_ld_fields(outer):
+            for f2, v2 in self._parse_ld_fields(v1):
+                if f2 != 2:
+                    continue
+                for _, inner_b64_bytes in self._parse_ld_fields(v2):
+                    try:
+                        inner = base64.b64decode(inner_b64_bytes.decode("utf-8") + "==")
+                    except Exception:
+                        continue
+                    for f4, v4 in self._parse_ld_fields(inner):
+                        if f4 == 3:
+                            return v4.decode("utf-8")
+
+        raise FetchError("Antigravity: refresh token not found in DB")
+
+    def _get_access_token(self, refresh_token: str) -> str:
+        client_id = os.environ.get("ANTIGRAVITY_CLIENT_ID", "")
+        client_secret = os.environ.get("ANTIGRAVITY_CLIENT_SECRET", "")
+        if not client_id or not client_secret:
+            raise FetchError("Antigravity credentials not configured — restart to run setup")
+        data = urllib.parse.urlencode({
+            "client_id": client_id,
+            "client_secret": client_secret,
+            "refresh_token": refresh_token,
+            "grant_type": "refresh_token",
+        }).encode()
+        req = urllib.request.Request(
+            ANTIGRAVITY_TOKEN_URL, data=data,
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                result = json.loads(resp.read().decode())
+        except urllib.error.HTTPError as e:
+            raise FetchError(f"Antigravity token refresh failed ({e.code})")
+        except urllib.error.URLError as e:
+            raise FetchError(f"Antigravity network error: {e.reason}")
+
+        token = result.get("access_token")
+        if not token:
+            raise FetchError("Antigravity: no access_token in refresh response")
+        return token
+
+    # ------------------------------------------------------------------
+    # Quota API
+    # ------------------------------------------------------------------
+
+    def fetch(self) -> AntigravityData:
+        refresh_token = self._get_refresh_token()
+        access_token = self._get_access_token(refresh_token)
+
+        req = urllib.request.Request(
+            ANTIGRAVITY_QUOTA_URL,
+            data=json.dumps({}).encode(),
+            headers={
+                "Authorization": f"Bearer {access_token}",
+                "Content-Type": "application/json",
+                "User-Agent": ANTIGRAVITY_UA,
+            },
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                raw = json.loads(resp.read().decode())
+        except urllib.error.HTTPError as e:
+            if e.code == 401:
+                raise FetchError("Antigravity: auth expired — reopen IDE")
+            raise FetchError(f"Antigravity quota API error ({e.code})")
+        except urllib.error.URLError as e:
+            raise FetchError(f"Antigravity network error: {e.reason}")
+
+        return self._parse(raw)
+
+    def _parse(self, raw: dict) -> AntigravityData:
+        import re
+        now = datetime.now(timezone.utc)
+        sprint_pct, sprint_reset = 0.0, now + timedelta(hours=5)
+        weekly_pct, weekly_reset = 0.0, now + timedelta(days=7)
+
+        for info in raw.get("models", {}).values():
+            qi = info.get("quotaInfo")
+            if not qi or "remainingFraction" not in qi or "resetTime" not in qi:
+                continue
+            remaining = float(qi["remainingFraction"])
+            used_pct = (1.0 - remaining) * 100.0
+            try:
+                s = qi["resetTime"]
+                s_clean = re.sub(r"[Zz]$|[+-]\d{2}:\d{2}$", "", s)
+                fmt = "%Y-%m-%dT%H:%M:%S.%f" if "." in s_clean else "%Y-%m-%dT%H:%M:%S"
+                reset_dt = datetime.strptime(s_clean, fmt).replace(tzinfo=timezone.utc)
+            except Exception:
+                continue
+
+            delta = (reset_dt - now).total_seconds()
+            if delta < 86400:           # resets within 24h → sprint bucket
+                if used_pct > sprint_pct:
+                    sprint_pct = used_pct
+                    sprint_reset = reset_dt
+            else:                       # resets in days → weekly bucket
+                if used_pct > weekly_pct:
+                    weekly_pct = used_pct
+                    weekly_reset = reset_dt
+
+        return AntigravityData(
+            sprint_pct=sprint_pct,
+            sprint_resets_at=sprint_reset,
+            weekly_pct=weekly_pct,
+            weekly_resets_at=weekly_reset,
+            last_updated=now,
+        )
+
+
+# ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
@@ -311,12 +527,175 @@ def format_timedelta(dt: datetime) -> tuple:
 
 
 # ---------------------------------------------------------------------------
+# First-run setup helpers
+# ---------------------------------------------------------------------------
+
+def _detect_antigravity_credentials() -> tuple:
+    """Try to extract client_id/secret from the local Antigravity IDE installation."""
+    import re
+    main_js = (
+        Path(os.environ.get("LOCALAPPDATA", ""))
+        / "Programs" / "Antigravity" / "resources" / "app" / "out" / "main.js"
+    )
+    if not main_js.exists():
+        return "", ""
+    try:
+        client_id = client_secret = ""
+        chunk_size = 65536
+        overlap = 512
+        with open(main_js, "rb") as f:
+            prev = b""
+            while True:
+                chunk = f.read(chunk_size)
+                if not chunk:
+                    break
+                data = prev + chunk
+                if not client_id:
+                    m = re.search(rb'[a-z]{3}="([\d-]+\.apps\.googleusercontent\.com)"', data)
+                    if m:
+                        client_id = m.group(1).decode()
+                if not client_secret:
+                    m = re.search(rb'[a-z]{3}="(GOCSPX-[A-Za-z0-9_-]+)"', data)
+                    if m:
+                        client_secret = m.group(1).decode()
+                if client_id and client_secret:
+                    break
+                prev = data[-overlap:]
+        return client_id, client_secret
+    except Exception as exc:
+        log.warning("Auto-detect credentials failed: %s", exc)
+        return "", ""
+
+
+def _save_env_values(values: dict) -> None:
+    """Write/update key=value pairs in the .env file."""
+    existing: dict = {}
+    if ENV_FILE.exists():
+        for line in ENV_FILE.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                k, _, v = line.partition("=")
+                existing[k.strip()] = v.strip()
+    existing.update(values)
+    lines = [f"{k}={v}" for k, v in existing.items()]
+    ENV_FILE.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def _run_setup_dialog() -> bool:
+    """Show a first-run dialog to collect Antigravity OAuth credentials.
+
+    Returns True if the user saved valid credentials, False if cancelled.
+    """
+    result = {"saved": False}
+
+    dlg = tk.Tk()
+    dlg.title("Claude Meter — Setup")
+    dlg.configure(bg=BG)
+    dlg.resizable(False, False)
+    dlg.attributes("-topmost", True)
+
+    # Center on screen
+    dlg.update_idletasks()
+    sw, sh = dlg.winfo_screenwidth(), dlg.winfo_screenheight()
+    dlg.geometry(f"420x320+{(sw - 420) // 2}+{(sh - 320) // 2}")
+
+    tk.Label(dlg, text="◉ Claude Meter — First-time Setup", bg=HEADER, fg=FG,
+             font=("Segoe UI", 10, "bold"), pady=8).pack(fill="x")
+
+    body = tk.Frame(dlg, bg=BG, padx=16, pady=10)
+    body.pack(fill="both", expand=True)
+
+    tk.Label(body, text="Google Antigravity OAuth credentials", bg=BG, fg="#5cb8ff",
+             font=("Segoe UI", 9, "bold")).pack(anchor="w")
+    tk.Label(body,
+             text=("Found in your Antigravity installation:\n"
+                   "%LocalAppData%\\Programs\\Antigravity\\resources\\app\\out\\main.js\n"
+                   'Search ".apps.googleusercontent.com" and "GOCSPX-"'),
+             bg=BG, fg=FG_DIM, font=("Segoe UI", 7), justify="left").pack(anchor="w", pady=(2, 8))
+
+    tk.Label(body, text="Client ID:", bg=BG, fg=FG_LABEL,
+             font=("Segoe UI", 8)).pack(anchor="w")
+    entry_id = tk.Entry(body, bg=BAR_BG, fg=FG, insertbackground=FG,
+                        font=("Segoe UI", 8), width=55, relief="flat")
+    entry_id.pack(fill="x", pady=(0, 6))
+
+    tk.Label(body, text="Client Secret:", bg=BG, fg=FG_LABEL,
+             font=("Segoe UI", 8)).pack(anchor="w")
+    entry_secret = tk.Entry(body, bg=BAR_BG, fg=FG, insertbackground=FG,
+                            font=("Segoe UI", 8), width=55, relief="flat", show="•")
+    entry_secret.pack(fill="x", pady=(0, 6))
+
+    lbl_status = tk.Label(body, text="", bg=BG, fg=BAR_CRIT, font=("Segoe UI", 7))
+    lbl_status.pack(anchor="w")
+
+    # Pre-fill if we have partial values already
+    if os.environ.get("ANTIGRAVITY_CLIENT_ID"):
+        entry_id.insert(0, os.environ["ANTIGRAVITY_CLIENT_ID"])
+    if os.environ.get("ANTIGRAVITY_CLIENT_SECRET"):
+        entry_secret.insert(0, os.environ["ANTIGRAVITY_CLIENT_SECRET"])
+
+    def on_save():
+        cid = entry_id.get().strip()
+        csec = entry_secret.get().strip()
+        if not cid or not csec:
+            lbl_status.config(text="Both fields are required.")
+            return
+        os.environ["ANTIGRAVITY_CLIENT_ID"] = cid
+        os.environ["ANTIGRAVITY_CLIENT_SECRET"] = csec
+        _save_env_values({"ANTIGRAVITY_CLIENT_ID": cid, "ANTIGRAVITY_CLIENT_SECRET": csec})
+        result["saved"] = True
+        dlg.destroy()
+
+    def on_skip():
+        dlg.destroy()
+
+    btn_frame = tk.Frame(body, bg=BG)
+    btn_frame.pack(fill="x", pady=(4, 0))
+    tk.Button(btn_frame, text="Save & Start", command=on_save,
+              bg="#0f3460", fg=FG, activebackground="#1a5490", activeforeground=FG,
+              relief="flat", padx=12, pady=4).pack(side="right", padx=(4, 0))
+    tk.Button(btn_frame, text="Skip (Antigravity section will be disabled)",
+              command=on_skip, bg=BAR_BG, fg=FG_DIM,
+              activebackground="#3a3a5a", activeforeground=FG,
+              relief="flat", padx=8, pady=4).pack(side="right")
+
+    dlg.mainloop()
+    return result["saved"]
+
+
+def _ensure_ag_credentials() -> None:
+    """Ensure Antigravity credentials are available.
+
+    Order of preference:
+    1. Already in os.environ (loaded from .env or system env)
+    2. Auto-detected from local Antigravity installation → saved to .env
+    3. User enters them via setup dialog → saved to .env
+    4. User skips → widget starts without Antigravity section
+    """
+    if os.environ.get("ANTIGRAVITY_CLIENT_ID") and os.environ.get("ANTIGRAVITY_CLIENT_SECRET"):
+        return
+
+    log.info("Antigravity credentials not found in .env — attempting auto-detect")
+    client_id, client_secret = _detect_antigravity_credentials()
+    if client_id and client_secret:
+        log.info("Auto-detected Antigravity credentials from IDE installation")
+        os.environ["ANTIGRAVITY_CLIENT_ID"] = client_id
+        os.environ["ANTIGRAVITY_CLIENT_SECRET"] = client_secret
+        _save_env_values({"ANTIGRAVITY_CLIENT_ID": client_id, "ANTIGRAVITY_CLIENT_SECRET": client_secret})
+        return
+
+    log.info("Auto-detect failed — showing setup dialog")
+    _run_setup_dialog()
+
+
+# ---------------------------------------------------------------------------
 # Widget
 # ---------------------------------------------------------------------------
 
 class ClaudeMeterWidget:
     def __init__(self):
         self.fetcher = UsageFetcher()
+        self.ag_fetcher = AntigravityFetcher()
         self.q: queue.Queue = queue.Queue()
         self._drag_x = 0
         self._drag_y = 0
@@ -342,6 +721,9 @@ class ClaudeMeterWidget:
         cached = self._load_cache()
         if cached:
             self._update_ui(cached)
+        ag_cached = self._load_ag_cache()
+        if ag_cached:
+            self._update_ag_ui(ag_cached)
 
         # Start refresh loop
         self._trigger_fetch()
@@ -462,6 +844,39 @@ class ClaudeMeterWidget:
                                   fg=FG_LABEL, font=("Segoe UI", 8))
         self.lbl_extra.pack(anchor="w")
 
+        # Antigravity section
+        tk.Frame(body, bg="#2a2a4a", height=1).pack(fill="x", pady=3)
+        tk.Label(body, text="◉ ANTIGRAVITY", bg=BG, fg="#5cb8ff",
+                 font=("Segoe UI", 7, "bold")).pack(anchor="w")
+
+        tk.Label(body, text="SPRINT", bg=BG, fg=FG_DIM,
+                 font=("Segoe UI", 7)).pack(anchor="w")
+        self.bar_ag_sprint = self._make_bar(body)
+        ag_sprint_row = tk.Frame(body, bg=BG)
+        ag_sprint_row.pack(fill="x")
+        self.lbl_ag_sprint_pct = tk.Label(ag_sprint_row, text="—", bg=BG, fg=FG,
+                                          font=("Segoe UI", 9))
+        self.lbl_ag_sprint_pct.pack(side="right")
+        self.lbl_ag_sprint_reset = tk.Label(ag_sprint_row, text="Reset in: —", bg=BG,
+                                            fg=FG_DIM, font=("Segoe UI", 8))
+        self.lbl_ag_sprint_reset.pack(side="left")
+
+        tk.Label(body, text="WEEKLY", bg=BG, fg=FG_DIM,
+                 font=("Segoe UI", 7)).pack(anchor="w", pady=(3, 0))
+        self.bar_ag_weekly = self._make_bar(body)
+        ag_weekly_row = tk.Frame(body, bg=BG)
+        ag_weekly_row.pack(fill="x")
+        self.lbl_ag_weekly_pct = tk.Label(ag_weekly_row, text="—", bg=BG, fg=FG,
+                                          font=("Segoe UI", 9))
+        self.lbl_ag_weekly_pct.pack(side="right")
+        self.lbl_ag_weekly_reset = tk.Label(ag_weekly_row, text="Reset in: —", bg=BG,
+                                            fg=FG_DIM, font=("Segoe UI", 8))
+        self.lbl_ag_weekly_reset.pack(side="left")
+
+        self.lbl_ag_error = tk.Label(body, text="", bg=BG, fg=BAR_CRIT,
+                                     font=("Segoe UI", 7), wraplength=WIDGET_W - 24)
+        self.lbl_ag_error.pack(anchor="w")
+
         # Footer
         tk.Frame(body, bg="#2a2a4a", height=1).pack(fill="x", pady=(3, 2))
         self.lbl_updated = tk.Label(body, text="Fetching...", bg=BG,
@@ -508,6 +923,16 @@ class ClaudeMeterWidget:
             traceback.print_exc()
             self.q.put(("err", error_msg))
 
+        try:
+            ag_data = self.ag_fetcher.fetch()
+            self.q.put(("ag_ok", ag_data))
+        except FetchError as e:
+            log.warning("Antigravity fetch error: %s", e)
+            self.q.put(("ag_err", str(e)))
+        except Exception as e:
+            log.warning("Antigravity unexpected error: %s", e)
+            self.q.put(("ag_err", f"AG error: {e}"))
+
     def _poll_queue(self):
         try:
             while True:
@@ -518,6 +943,16 @@ class ClaudeMeterWidget:
                         self._has_error = False
                         self._update_ui(payload)
                         self._save_cache(payload)
+                    elif kind == "ag_ok":
+                        self._update_ag_ui(payload)
+                        self._save_ag_cache(payload)
+                    elif kind == "ag_err":
+                        log.debug("AG error displayed: %s", payload)
+                        self.lbl_ag_error.config(text=payload)
+                        self.bar_ag_sprint.coords("fill", 0, 0, 0, 10)
+                        self.bar_ag_weekly.coords("fill", 0, 0, 0, 10)
+                        self.lbl_ag_sprint_pct.config(text="—")
+                        self.lbl_ag_weekly_pct.config(text="—")
                     else:
                         self._has_error = True
                         log.warning("Fetch error: %s", payload)
@@ -591,6 +1026,18 @@ class ClaudeMeterWidget:
         self.lbl_updated.config(text=self._ago(d.last_updated), fg=FG_LABEL)
         self.lbl_last_ok.config(text="")
 
+    def _update_ag_ui(self, d: AntigravityData):
+        self.lbl_ag_error.config(text="")
+        self._update_bar(self.bar_ag_sprint, d.sprint_pct)
+        self.lbl_ag_sprint_pct.config(text=f"{d.sprint_pct:.1f}%")
+        t, c = format_timedelta(d.sprint_resets_at)
+        self.lbl_ag_sprint_reset.config(text=f"Reset in: {t}", fg=c)
+
+        self._update_bar(self.bar_ag_weekly, d.weekly_pct)
+        self.lbl_ag_weekly_pct.config(text=f"{d.weekly_pct:.1f}%")
+        t, c = format_timedelta(d.weekly_resets_at)
+        self.lbl_ag_weekly_reset.config(text=f"Reset in: {t}", fg=c)
+
     def _ago(self, dt: datetime) -> str:
         elapsed = int((datetime.now(timezone.utc) - dt).total_seconds())
         if elapsed < 60:
@@ -649,20 +1096,40 @@ class ClaudeMeterWidget:
 
     def _save_cache(self, d: UsageData):
         try:
-            CACHE_FILE.write_text(
-                json.dumps({
-                    "five_hour_pct": d.five_hour_pct,
-                    "five_hour_resets_at": d.five_hour_resets_at.isoformat(),
-                    "seven_day_pct": d.seven_day_pct,
-                    "seven_day_resets_at": d.seven_day_resets_at.isoformat(),
-                    "sonnet_pct": d.sonnet_pct,
-                    "opus_pct": d.opus_pct,
-                    "extra_enabled": d.extra_enabled,
-                    "extra_limit_cents": d.extra_limit_cents,
-                    "extra_used_cents": d.extra_used_cents,
-                }),
-                encoding="utf-8"
-            )
+            existing = {}
+            try:
+                existing = json.loads(CACHE_FILE.read_text(encoding="utf-8"))
+            except Exception:
+                pass
+            existing.update({
+                "five_hour_pct": d.five_hour_pct,
+                "five_hour_resets_at": d.five_hour_resets_at.isoformat(),
+                "seven_day_pct": d.seven_day_pct,
+                "seven_day_resets_at": d.seven_day_resets_at.isoformat(),
+                "sonnet_pct": d.sonnet_pct,
+                "opus_pct": d.opus_pct,
+                "extra_enabled": d.extra_enabled,
+                "extra_limit_cents": d.extra_limit_cents,
+                "extra_used_cents": d.extra_used_cents,
+            })
+            CACHE_FILE.write_text(json.dumps(existing), encoding="utf-8")
+        except Exception:
+            pass
+
+    def _save_ag_cache(self, d: AntigravityData):
+        try:
+            existing = {}
+            try:
+                existing = json.loads(CACHE_FILE.read_text(encoding="utf-8"))
+            except Exception:
+                pass
+            existing.update({
+                "ag_sprint_pct": d.sprint_pct,
+                "ag_sprint_resets_at": d.sprint_resets_at.isoformat(),
+                "ag_weekly_pct": d.weekly_pct,
+                "ag_weekly_resets_at": d.weekly_resets_at.isoformat(),
+            })
+            CACHE_FILE.write_text(json.dumps(existing), encoding="utf-8")
         except Exception:
             pass
 
@@ -688,6 +1155,25 @@ class ClaudeMeterWidget:
         except Exception:
             return None
 
+    def _load_ag_cache(self) -> Optional[AntigravityData]:
+        try:
+            data = json.loads(CACHE_FILE.read_text(encoding="utf-8"))
+            if "ag_sprint_pct" not in data:
+                return None
+            def parse_dt(s):
+                import re
+                s_clean = re.sub(r'[Zz]$|[+-]\d{2}:\d{2}$', '', s)
+                return datetime.fromisoformat(s_clean).replace(tzinfo=timezone.utc)
+            return AntigravityData(
+                sprint_pct=float(data["ag_sprint_pct"]),
+                sprint_resets_at=parse_dt(data["ag_sprint_resets_at"]),
+                weekly_pct=float(data["ag_weekly_pct"]),
+                weekly_resets_at=parse_dt(data["ag_weekly_resets_at"]),
+                last_updated=datetime.now(timezone.utc),
+            )
+        except Exception:
+            return None
+
     # ------------------------------------------------------------------
     # Close
     # ------------------------------------------------------------------
@@ -705,6 +1191,7 @@ class ClaudeMeterWidget:
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
+    _ensure_ag_credentials()
     import time
     time.sleep(120)
     ClaudeMeterWidget().run()
