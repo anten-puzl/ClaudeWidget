@@ -70,7 +70,7 @@ API_BETA_HEADER  = "oauth-2025-04-20"
 REFRESH_MS       = 10 * 60 * 1000   # 10 minutes
 POLL_MS          = 500
 WIDGET_W         = 280
-WIDGET_H         = 440
+WIDGET_H         = 500
 POS_FILE         = Path.home() / ".claude" / "meter_pos.json"
 CACHE_FILE       = Path.home() / ".claude" / "meter_cache.json"
 
@@ -118,6 +118,8 @@ class AntigravityData:
     weekly_pct: float
     weekly_resets_at: datetime
     last_updated: datetime
+    sonnet_pct: Optional[float] = None
+    opus_pct: Optional[float] = None
 
 
 class FetchError(Exception):
@@ -448,26 +450,44 @@ class AntigravityFetcher:
         return self._parse(raw)
 
     def _parse(self, raw: dict) -> AntigravityData:
-        import re
+        import re, json as _json
+        log.debug("[AG] raw response: %s", _json.dumps(raw, indent=2, default=str))
         now = datetime.now(timezone.utc)
         sprint_pct, sprint_reset = 0.0, now + timedelta(hours=5)
         weekly_pct, weekly_reset = 0.0, now + timedelta(days=7)
+        sonnet_pct: Optional[float] = None
+        opus_pct: Optional[float] = None
 
-        for info in raw.get("models", {}).values():
+        for model_name, info in raw.get("models", {}).items():
             qi = info.get("quotaInfo")
-            if not qi or "remainingFraction" not in qi or "resetTime" not in qi:
+            if not qi or "remainingFraction" not in qi:
+                log.debug("[AG] %-40s  no quotaInfo", model_name)
                 continue
             remaining = float(qi["remainingFraction"])
             used_pct = (1.0 - remaining) * 100.0
+
+            # Track Claude model usage regardless of resetTime
+            if model_name == "claude-sonnet-4-6":
+                sonnet_pct = used_pct
+            elif model_name == "claude-opus-4-6-thinking":
+                opus_pct = used_pct
+
+            if "resetTime" not in qi:
+                continue
             try:
                 s = qi["resetTime"]
                 s_clean = re.sub(r"[Zz]$|[+-]\d{2}:\d{2}$", "", s)
                 fmt = "%Y-%m-%dT%H:%M:%S.%f" if "." in s_clean else "%Y-%m-%dT%H:%M:%S"
                 reset_dt = datetime.strptime(s_clean, fmt).replace(tzinfo=timezone.utc)
             except Exception:
+                log.debug("[AG] %-40s  bad resetTime: %s", model_name, qi.get("resetTime"))
                 continue
 
             delta = (reset_dt - now).total_seconds()
+            bucket = "sprint" if delta < 86400 else "weekly"
+            log.debug("[AG] %-40s  used=%5.1f%%  resets_in=%6.0fs  bucket=%s",
+                      model_name, used_pct, delta, bucket)
+
             if delta < 86400:           # resets within 24h → sprint bucket
                 if used_pct > sprint_pct:
                     sprint_pct = used_pct
@@ -483,6 +503,8 @@ class AntigravityFetcher:
             weekly_pct=weekly_pct,
             weekly_resets_at=weekly_reset,
             last_updated=now,
+            sonnet_pct=sonnet_pct,
+            opus_pct=opus_pct,
         )
 
 
@@ -873,6 +895,15 @@ class ClaudeMeterWidget:
                                             fg=FG_DIM, font=("Segoe UI", 8))
         self.lbl_ag_weekly_reset.pack(side="left")
 
+        ag_claude_frame = tk.Frame(body, bg=BG)
+        ag_claude_frame.pack(fill="x", pady=(3, 0))
+        self.lbl_ag_sonnet = tk.Label(ag_claude_frame, text="", bg=BG,
+                                      fg=FG_LABEL, font=("Segoe UI", 8))
+        self.lbl_ag_sonnet.pack(anchor="w")
+        self.lbl_ag_opus = tk.Label(ag_claude_frame, text="", bg=BG,
+                                    fg=FG_LABEL, font=("Segoe UI", 8))
+        self.lbl_ag_opus.pack(anchor="w")
+
         self.lbl_ag_error = tk.Label(body, text="", bg=BG, fg=BAR_CRIT,
                                      font=("Segoe UI", 7), wraplength=WIDGET_W - 24)
         self.lbl_ag_error.pack(anchor="w")
@@ -1038,6 +1069,11 @@ class ClaudeMeterWidget:
         t, c = format_timedelta(d.weekly_resets_at)
         self.lbl_ag_weekly_reset.config(text=f"Reset in: {t}", fg=c)
 
+        if d.sonnet_pct is not None:
+            self.lbl_ag_sonnet.config(text=f"Sonnet sprint: {d.sonnet_pct:.1f}%")
+        if d.opus_pct is not None:
+            self.lbl_ag_opus.config(text=f"Opus sprint:   {d.opus_pct:.1f}%")
+
     def _ago(self, dt: datetime) -> str:
         elapsed = int((datetime.now(timezone.utc) - dt).total_seconds())
         if elapsed < 60:
@@ -1128,6 +1164,8 @@ class ClaudeMeterWidget:
                 "ag_sprint_resets_at": d.sprint_resets_at.isoformat(),
                 "ag_weekly_pct": d.weekly_pct,
                 "ag_weekly_resets_at": d.weekly_resets_at.isoformat(),
+                "ag_sonnet_pct": d.sonnet_pct,
+                "ag_opus_pct": d.opus_pct,
             })
             CACHE_FILE.write_text(json.dumps(existing), encoding="utf-8")
         except Exception:
@@ -1170,6 +1208,8 @@ class ClaudeMeterWidget:
                 weekly_pct=float(data["ag_weekly_pct"]),
                 weekly_resets_at=parse_dt(data["ag_weekly_resets_at"]),
                 last_updated=datetime.now(timezone.utc),
+                sonnet_pct=data.get("ag_sonnet_pct"),
+                opus_pct=data.get("ag_opus_pct"),
             )
         except Exception:
             return None
